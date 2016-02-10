@@ -27,24 +27,32 @@ if sys.version_info < (3, 4):
     raise Exception('Must use Python 3.4 or later')
 
 from hpOneView import *
-from functools import partial
-import amqp
+import pika
+from pika.credentials import ExternalCredentials
+from pika.exceptions import ConnectionClosed
 import json
 import ssl
 import datetime
+import time
 
 
-def callback(channel, msg):
+# Connection retry count
+reconnectCount = 0
+
+class RetryableConnectionClosed(Exception):
+    pass
+
+def callback(channel, method, properties, body):
     # ACK receipt of message
-    channel.basic_ack(msg.delivery_tag)
+    channel.basic_ack(method.delivery_tag)
 
     # Convert from json into a Python dictionary
-    body = json.loads(msg.body)
-
+    body = json.loads(body.decode("utf-8"))
     # Create a new variable name 'resource' to point to the
     # nested resource dictionary inside of the body
     resource = body['resource']
-
+    print(resource['uri'])
+    print("\n")
     # Test to make sure that there is an alertState key
     # in the resource dictionary, if there is continue
     if 'alertState' in list(resource.keys()):
@@ -83,15 +91,13 @@ def callback(channel, msg):
             print('')
 
     # Cancel this callback
-    if msg.body == 'quit':
-        channel.basic_cancel(msg.consumer_tag)
-
+    if body == 'quit':
+        channel.basic_cancel(method.consumer_tag)
 
 def recv(host, route):
+    global reconnectCount
     # Create and bind to queue
     EXCHANGE_NAME = 'scmb'
-    dest = host + ':5671'
-
     # Setup our ssl options
     ssl_options = ({'ca_certs': 'caroot.pem',
                     'certfile': 'client.pem',
@@ -101,21 +107,50 @@ def recv(host, route):
                     'server_side': False})
 
     # Connect to RabbitMQ
-    conn = amqp.Connection(dest, login_method='EXTERNAL', ssl=ssl_options)
+    try:
+        conn = pika.BlockingConnection(pika.ConnectionParameters(
+                   host, 5671, ssl=True, ssl_options=ssl_options, credentials=ExternalCredentials(), heartbeat_interval=10))
+        # Reset reconnectCount after reconnect succeed
+        if reconnectCount > 0:
+            print('Reconnect succeeded!')
+            print("\n")
+            reconnectCount = 0
+    except ConnectionClosed as ex:
+        # If connection failed at the beginning no retry
+        if reconnectCount == 0:
+            raise ex
+        else:
+            raise RetryableConnectionClosed(ex)
 
     ch = conn.channel()
-    qname, _, _ = ch.queue_declare()
-    ch.queue_bind(qname, EXCHANGE_NAME, route)
-    ch.basic_consume(qname, callback=partial(callback, ch))
+    qname = ch.queue_declare(auto_delete=True).method.queue
+    ch.queue_bind(queue=qname, exchange=EXCHANGE_NAME, routing_key=route)
+    ch.basic_consume(callback, queue=qname)
 
     # Start listening for messages
-    while ch.callbacks:
-        ch.wait()
-
+    try:
+        ch.start_consuming() 
+    except ConnectionClosed as ex:
+        print('Connection closed! Try to reconnect. If connection is closed due to HA failover reconnect should succeed very soon.')
+        raise RetryableConnectionClosed(ex)
+    
     ch.close()
     conn.close()
 
-
+def recvWithRetry(host, route):
+    # When failover happens reconnect to the server.
+    # Exit after maxReconnectCount retries
+    maxReconnectCount = 180
+    global reconnectCount
+    while reconnectCount < maxReconnectCount:
+        try:
+            recv(host, route)
+        except RetryableConnectionClosed:
+            print('.', end="", flush=True)
+            time.sleep(1)
+            reconnectCount = reconnectCount+1
+    print('Can not make connection after %d retries' % reconnectCount)
+            
 def login(con, credential):
     # Login with givin credentials
     try:
@@ -165,7 +200,7 @@ def main():
     parser.add_argument('-p', '--pass', dest='passwd', required=True,
                         help='HP OneView Password')
     parser.add_argument('-r', '--route', dest='route', required=False,
-                        default='scmb.alerts.#', help='AMQP Routing Key')
+                        default='scmb.#', help='AMQP Routing Key')
     parser.add_argument('-g', '--gen', dest='gen', required=False,
                         action='store_true',
                         help='Generate the Rabbit MQ keypair and exit')
@@ -191,7 +226,7 @@ def main():
         getRabbitKp(sec)
         sys.exit()
 
-    recv(args.host, args.route)
+    recvWithRetry(args.host, args.route)
 
 if __name__ == '__main__':
     import sys
